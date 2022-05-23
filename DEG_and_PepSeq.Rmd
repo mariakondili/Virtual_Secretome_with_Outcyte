@@ -1,0 +1,267 @@
+---
+title: "Virtual Secretome::analysis of DE genes"
+author: "Maria Kondili"
+date: "06/10/2021"
+output: html_document
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(DESeq2)
+library(tidyverse)
+library(dplyr)
+
+```
+
+```{r define user_input }
+data_dir <- "~/projects/secretome/DESeq_data/"
+DESeq_table_file <- paste0(data_dir,"Cond1_vs_Cond2_DEgenes.txt")
+out_dir <- "~/projects/secretome/Outputs/"
+pepseqs_out <- paste0(out_dir,"myPepSeqs/")
+
+l2fc_co <- 1
+pval_co <- 0.05
+
+```
+
+```{r}
+
+# work_dir="~/PROJECTS/DMD_Secretome/"
+# data_dir=paste0(work_dir, "Data/DEGs")
+
+```
+
+```{r, echo=TRUE}
+
+de_set  <- read.table(DESeq_table_file, sep="\t", header=T, as.is=T)
+
+de_set %>% head
+de_set$GeneName <- rownames(de_set)
+
+siggenes <- rownames(subset(de_set, abs(logFC)> l2fc_co & adj.P.Val < pval_co ))
+
+```
+
+#### Volcano Plot
+
+```{r volcano_plot, echo=T, include=TRUE}
+
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(reshape2))
+
+create_volcano_plot <- function(de_set, co_lfc, co_pval,mytitle="Cond1_vs_Cond2") {
+        ## Define colours by values :
+        #  co_pval = 1.3
+        # co_lfc = 1
+        condition <-  with(de_set,  ifelse( logFC > co_lfc &  adj.P.Val < co_pval,
+                                                    "Signif & HighlyExpr",
+                                            ifelse( logFC  < -co_lfc & adj.P.Val < co_pval,
+                                                    "Signif & HighlyExpr",
+                                            "NotSignif")))
+
+         colour_values <- c("Signif & HighlyExpr" = "chartreuse3",
+                            "Signif & HighlyExpr" = "chartreuse3",
+                            "NotSignif" = "black")
+
+        ggplot(de_set, aes(x=logFC,y = -log10(adj.P.Val), colour=condition)) +
+              scale_colour_manual(values=colour_values) +
+              geom_point(size = 2, alpha = 1, na.rm = T) +
+              ggtitle(label = paste("Volcano Plot of",mytitle,sep=" "))  +
+              xlab("log2(Fold-Change)") +
+              ylab("-log10 Adj.P-value") +
+              theme_bw(base_size = 14) +
+              theme(legend.position = "right") +
+              scale_y_continuous(trans = "log1p") +
+              scale_x_continuous(breaks=seq(-3.5, 5,by=1) )
+
+}
+
+
+create_volcano_plot( de_set, co_lfc = 1, co_pval=0.05, mytitle= "" )
+
+```
+
+#### Convert Gene_Names to EntrezID
+
+```{r convert_ids }
+
+source("convert_Symbol2ID.R")
+
+convert_Symbol2ID <- function(genenames_list ){
+
+	library(org.Hs.eg.db) # installed via biocLite. Cannot call library from an R-variable/object
+	library(AnnotationDbi)
+
+  converted_ids <- mapIds(x=org.Hs.eg.db,
+	                       keys=genenames_list,
+	                       column="ENTREZID",
+	                       keytype="SYMBOL",
+	                       multiVals = "first")
+	return( converted_ids )
+
+#column --> what I want to extract
+#keytypes(org.Hs.eg.db) --> what I provide as input
+# [1] "ACCNUM"       "ALIAS"        "ENSEMBL"      "ENSEMBLPROT"  "ENSEMBLTRANS"
+# [6] "ENTREZID"     "ENZYME"       "EVIDENCE"     "EVIDENCEALL"  "GENENAME"
+# [11] "GO"           "GOALL"        "IPI"          "MGI"          "ONTOLOGY"
+# [16] "ONTOLOGYALL"  "PATH"         "PFAM"         "PMID"         "PROSITE"
+# [21] "REFSEQ"       "SYMBOL"       "UNIGENE"      "UNIPROT"
+
+}
+
+converted_IDs_set <- convert_Symbol2ID(siggenes)
+converted_IDs_set %>% length
+
+
+## For more gene-sets use map:
+# converted_IDs_list <- purrr::map(list(siggenes_set1 , siggenes_set2 ,siggenes_set3 ), ~convert_Symbol2ID(.x) )
+# names(converted_IDs_list) <- c("set1","set2", "set3")
+
+
+```
+
+#### Write the 2 IDs in a table : geneName -->EntrezID
+
+```{r}
+
+write_IDs_table <- function(converted_list, out_name){
+
+        library(readr)
+        IDs_table <- data.frame("genename"=names(converted_list) ,
+                                "entrezID"=as.data.frame(converted_list)[,1])
+        write_delim(IDs_table, out_name, delim ="\t")
+}
+
+
+#dir.create("Output",showWarnings = F)
+dir.create(out_dir,showWarnings = F)
+
+# ids_out = paste0(out_dir, "GeneNames2Entrez/")
+# dir.create(ids_out,showWarnings = F)
+
+write_IDs_table(converted_IDs_set, paste0(out_dir,"GeneNames2Entrez.tsv"))
+
+
+```
+
+#### Extract Prot_Seq from each ID
+
+```{r get_protein_seq }
+
+library(biomaRt)
+
+#listMarts()
+ensembl = useMart("ensembl")
+ensembl = useDataset("hsapiens_gene_ensembl",mart=ensembl) ##Mouse genes (GRCm38.p6)
+filters = listFilters(ensembl)
+
+
+###Requête avec getBM =====> On garde cette version, getBM est bien plus complet que getSequence !!!
+##Il s'agit du dataframe qui sera utilisé pour la suite, car plus complet que getSequence
+
+attributes_bm <- c("peptide",
+                   "entrezgene_id",
+                   "uniprotswissprot",
+                   "uniprotsptrembl" )
+
+
+##> Test for 1 EntrezID
+#getBM(attributes = c("peptide","entrezgene_id",filters = "entrezgene_id",values ="64236",mart = ensembl)
+
+
+prot_attributes <- list()
+
+prot_attributes <- getBM(attributes = attributes_bm,
+                         filters = "entrezgene_id",
+                         values = converted_IDs_set,
+                         mart = ensembl)
+
+##Nettoyage de protein_bm
+prot_attributes.filt  <- subset(prot_attributes, peptide != "Sequence unavailable") )
+
+
+```
+
+Save prot.sequences in Fasta
+
+```{r save_fasta }
+
+extract_pepseq <- function(prot_curated) {    
+    protseq_clean <- prot_curated %>%  
+                            pluck("peptide") %>%
+                            as.vector() %>%
+                            as.character() %>%  
+                            str_remove(pattern="\\*")
+
+    prot_curated$peptide <- protseq_clean
+
+
+    PepSeq_df <- with(prot_curated, data.frame("Seq"= peptide,
+                                               "Info"= paste(entrezgene_id,
+                                                "|", uniprotswissprot,
+                                                "|", uniprotsptrembl,
+                                                "|", "stop")))
+
+    return(PepSeq_df)
+}
+
+```
+
+
+```{r call function-peptide seqs for each set }
+
+PepSeqs  <- extract_pepseq(prot_attributes.filt)
+
+```
+
+#### Number of sequences per set of DE.genes
+
+```{r check number of sequences per set of DE.genes }
+PepSeqs$Seq %>% length
+```
+
+```{r df_to_fasta function }
+
+df_to_fasta_pepseq <- function(PepSeq_df,out_dir,suffix="PepSeq_") {
+
+    steps = seq(1, length(PepSeq_df$Seq), by=300)
+    for( i in steps ) {
+          j = i + 299
+          PepSeq_x <- PepSeq_df[i:j, ]
+          slice = paste0(i,"_to_",j)
+          exportFASTA(PepSeq_x, paste0(out_dir , suffix,slice, ".fasta"))
+     }
+}
+
+```
+
+#### Call Function -> save Prot_Seq of each D.E.Geneset in a folder
+#### (each file of 300 seq)
+
+```{r write in file-call function }
+
+prot_outdir <- paste0(out_dir, "Protein_Sequences/")
+dir.create(prot_outdir,showWarnings = FALSE)
+
+## Create sub-dir for different gene-sets' fasta-files
+set_out <- paste0(prot_outdir, pepseqs_out )
+
+df_to_fasta_pepseq(PepSeqs, set_out)
+
+
+#> If geneIDs are short from the last 300-chunk it will write :
+# >NA
+#  NA
+
+```
+
+<!-- ```{r}
+#### Overview of one fasta written
+library(seqinr)
+set1_chunk1 <- read.fasta(file = paste0(pepseqs_out,"PepSeq_1_to_300.fasta"), as.string=TRUE,seqtype="AA")
+
+set1_chunk1[[1]]
+
+``` -->
